@@ -27,7 +27,7 @@ st.markdown("""
 """)
 
 # 初始化session state
-for key in ['df', 'df_monthly', 'trained_model', 'future_features', 'full_data_with_revenue', 'historical_unit_price']:
+for key in ['df', 'df_monthly', 'trained_model', 'future_features', 'full_data_with_revenue']:
     if key not in st.session_state:
         st.session_state[key] = None
 
@@ -125,21 +125,9 @@ with st.sidebar:
     marketing_file = st.file_uploader("上传未来营销计划", type=['xlsx', 'xls', 'csv'],
                                      help="用于SARIMAX预测，需包含未来日期的营销活动强度")
     
-    # 单价设置
+    # 单价设置（自动模式）
     st.subheader("💰 价格设置")
-    historical_unit_price = st.number_input(
-        "历史数据单价(元)", 
-        min_value=1, max_value=500, value=35, step=1,
-        help="历史数据中每份游戏的销售单价",
-        key="hist_price_input"
-    )
-    st.session_state.historical_unit_price = historical_unit_price
-    
-    future_unit_price = st.number_input(
-        "未来预测期单价(元)", 
-        min_value=1, max_value=500, value=35, step=1,
-        help="未来预测期间每份游戏的销售单价"
-    )
+    st.info("当前版本已启用自动单价模式：历史单价自动识别，未来单价自动预测。")
     
     st.divider()
     
@@ -263,10 +251,8 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
         existing_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
         df = df.rename(columns=existing_mapping)
         
-        # 确保有unit_price列
-        if 'unit_price' not in df.columns:
-            df['unit_price'] = st.session_state.historical_unit_price
-            st.info(f"数据中未找到单价列，已使用默认单价 {st.session_state.historical_unit_price} 元")
+        # 自动识别并清洗历史单价
+        df['unit_price'] = prepare_unit_price_series(df)
         
         # 计算Steam特征（如果提供了好评/差评数据）
         if 'steam_positive' in df.columns and 'steam_negative' in df.columns:
@@ -277,7 +263,7 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
             )
             df['net_positive'] = df['steam_positive'] - df['steam_negative']
         
-        # 计算总销售额
+        # 使用清洗后的单价重新计算总销售额
         df['total_revenue'] = df['monthly_sales'] * df['unit_price']
         
         # 处理国内平台数据
@@ -336,6 +322,109 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
     except Exception as e:
         return None, f"数据处理失败: {str(e)}"
 
+def prepare_unit_price_series(data, min_price=1.0, max_price=500.0, fallback_price=35.0):
+    """自动生成并清洗历史单价序列。优先使用unit_price，其次用total_revenue/monthly_sales反推。"""
+    df = data.copy()
+
+    unit_price = pd.Series(np.nan, index=df.index, dtype=float)
+    if 'unit_price' in df.columns:
+        unit_price = pd.to_numeric(df['unit_price'], errors='coerce')
+
+    implied_price = pd.Series(np.nan, index=df.index, dtype=float)
+    if 'total_revenue' in df.columns and 'monthly_sales' in df.columns:
+        sales = pd.to_numeric(df['monthly_sales'], errors='coerce')
+        revenue = pd.to_numeric(df['total_revenue'], errors='coerce')
+        valid_sales = sales > 0
+        implied_price.loc[valid_sales] = (revenue.loc[valid_sales] / sales.loc[valid_sales]).values
+
+    merged_price = unit_price.combine_first(implied_price)
+    merged_price = pd.to_numeric(merged_price, errors='coerce')
+    merged_price[(~np.isfinite(merged_price)) | (merged_price <= 0)] = np.nan
+
+    valid = merged_price.dropna()
+    if len(valid) == 0:
+        st.warning(f"未识别到有效单价，已回退为默认单价 {fallback_price:.0f} 元")
+        return pd.Series([fallback_price] * len(df), index=df.index, dtype=float)
+
+    low, high = valid.quantile([0.05, 0.95])
+    low = max(float(low), min_price)
+    high = min(float(high), max_price)
+    if low > high:
+        low, high = min_price, max_price
+
+    cleaned = merged_price.clip(lower=low, upper=high)
+    cleaned = cleaned.interpolate(limit_direction='both')
+    cleaned = cleaned.ffill().bfill()
+    cleaned = cleaned.clip(lower=min_price, upper=max_price)
+
+    if cleaned.isna().any():
+        cleaned = cleaned.fillna(float(valid.median()))
+
+    return cleaned.astype(float)
+
+def forecast_feature_series(series, steps, slope_clip=0.1):
+    """对未来特征做平滑递推，避免整段复制最后一期。"""
+    s = pd.to_numeric(series, errors='coerce').astype(float)
+    s = s.replace([np.inf, -np.inf], np.nan).interpolate(limit_direction='both').ffill().bfill()
+    if len(s.dropna()) == 0:
+        return np.zeros(steps)
+
+    base_window = min(6, len(s))
+    recent = s.iloc[-base_window:].values
+    base = float(np.mean(recent))
+
+    if len(s) >= 2:
+        x = np.arange(len(s), dtype=float)
+        y = s.values
+        slope = float(np.polyfit(x[-base_window:], y[-base_window:], deg=1)[0])
+    else:
+        slope = 0.0
+
+    scale = max(abs(base), 1.0)
+    slope = float(np.clip(slope, -slope_clip * scale, slope_clip * scale))
+    t = np.arange(1, steps + 1, dtype=float)
+    pred = base + slope * t
+    return pred
+
+def forecast_unit_price(data, total_months, price_col='unit_price'):
+    """预测未来单价（月度序列）：近期均值 + 受限趋势 + 温和均值回归。"""
+    series = pd.to_numeric(data[price_col], errors='coerce').astype(float)
+    series = series.replace([np.inf, -np.inf], np.nan).interpolate(limit_direction='both').ffill().bfill()
+
+    if len(series.dropna()) == 0:
+        base_price = 35.0
+        t = np.arange(1, total_months + 1, dtype=float)
+        return np.maximum(base_price * np.exp(-0.002 * t), 1.0)
+
+    recent_window = min(6, len(series))
+    recent = series.iloc[-recent_window:].values
+    long_run_mean = float(series.mean())
+    base = float(np.mean(recent))
+
+    if len(series) >= 2:
+        x = np.arange(len(series), dtype=float)
+        slope = float(np.polyfit(x[-recent_window:], series.values[-recent_window:], deg=1)[0])
+    else:
+        slope = -0.02 * max(base, 1.0)
+
+    slope = float(np.clip(slope, -0.03 * max(base, 1.0), 0.02 * max(base, 1.0)))
+
+    t = np.arange(1, total_months + 1, dtype=float)
+    trend_part = base + slope * t
+    revert_part = (long_run_mean - base) * (1 - np.exp(-0.08 * t))
+    structural_decay = np.exp(-0.002 * t)
+    pred = (trend_part + revert_part) * structural_decay
+
+    if len(series) >= 12:
+        month_avg = data.assign(_price=series).groupby(data['date'].dt.month)['_price'].mean()
+        overall_avg = float(series.mean()) if float(series.mean()) > 0 else 1.0
+        future_dates = pd.date_range(data['date'].iloc[-1] + pd.offsets.MonthBegin(1), periods=total_months, freq='MS')
+        seasonality = future_dates.month.map(month_avg / overall_avg).astype(float).values
+        seasonality = np.clip(seasonality, 0.9, 1.1)
+        pred = pred * seasonality
+
+    return np.clip(pred, a_min=1.0, a_max=None)
+
 # 预测模型函数
 def train_sarimax_model(data, target_col='monthly_sales', exogenous_cols=None, order=(1,1,1), seasonal_order=(1,1,1,12)):
     """训练SARIMAX模型"""
@@ -367,7 +456,9 @@ def lifecycle_decay_forecast(data, target_col='monthly_sales', total_months=12):
 
     if n < 2:
         base = max(float(sales[-1]) if n == 1 else 0.0, 0.0)
-        pred = np.repeat(base, total_months)
+        t = np.arange(1, total_months + 1, dtype=float)
+        # 短样本下采用轻微指数衰减，避免整段重复常数
+        pred = base * np.exp(-0.03 * t)
         lower = pred * 0.85
         upper = pred * 1.15
     else:
@@ -391,10 +482,11 @@ def lifecycle_decay_forecast(data, target_col='monthly_sales', total_months=12):
         pred_log = intercept + slope * future_x
         pred = np.expm1(pred_log)
 
-        # 长尾锚定：以最近销量中位数作为最低合理基线，避免下穿失真
+        # 长尾软收敛：使用动态尾部基线，避免硬地板导致的长段常数平台
         tail_anchor = np.median(sales[-min(6, n):])
-        floor_level = max(tail_anchor * 0.5, 0.0)
-        pred = np.maximum(pred, floor_level)
+        t = np.arange(1, total_months + 1, dtype=float)
+        dynamic_floor = np.maximum(tail_anchor * (0.35 * np.exp(-0.06 * t) + 0.08), 0.0)
+        pred = np.maximum(pred, dynamic_floor)
 
         # 限制不超过历史首发峰值附近，避免过度外推
         pred = np.minimum(pred, peak_sales * 1.1)
@@ -406,7 +498,7 @@ def lifecycle_decay_forecast(data, target_col='monthly_sales', total_months=12):
         upper = np.expm1(pred_log + z * resid_std)
 
         # 置信区间同样遵循业务边界
-        lower = np.maximum(lower, floor_level * 0.8)
+        lower = np.maximum(lower, dynamic_floor * 0.8)
         upper = np.minimum(np.maximum(upper, pred), peak_sales * 1.35)
 
     last_date = data['date'].iloc[-1]
@@ -458,8 +550,22 @@ def sarimax_log_forecast(data, target_col, total_months, exogenous_cols=None, or
 
     X_future = None
     if exogenous_cols:
-        last_values = model_data[exogenous_cols].iloc[-1:].copy()
-        X_future = pd.concat([last_values] * total_months, ignore_index=True)
+        future_dates = pd.date_range(model_data['date'].iloc[-1] + pd.offsets.MonthBegin(1), periods=total_months, freq='MS')
+        X_future = pd.DataFrame(index=range(total_months))
+        for col in exogenous_cols:
+            if col == 'month_num' and col in model_data.columns:
+                start = float(model_data[col].iloc[-1])
+                X_future[col] = np.arange(start + 1, start + total_months + 1)
+            elif col == 'year':
+                X_future[col] = future_dates.year
+            elif col == 'month':
+                X_future[col] = future_dates.month
+            elif col == 'marketing_event':
+                X_future[col] = 0.0
+            elif col in model_data.columns:
+                X_future[col] = forecast_feature_series(model_data[col], total_months)
+            else:
+                X_future[col] = 0.0
 
     forecast = results.get_forecast(steps=total_months, exog=X_future)
     pred_log = forecast.predicted_mean.values
@@ -476,7 +582,7 @@ def sarimax_log_forecast(data, target_col, total_months, exogenous_cols=None, or
     })
     return clip_prediction_bounds(predictions)
 
-def rolling_forecast(data, target_col, total_months, window_months, update_freq, future_price, feature_cols=None):
+def rolling_forecast(data, target_col, total_months, window_months, update_freq, feature_cols=None):
     """分阶段滚动预测"""
     if feature_cols is None:
         feature_cols = []
@@ -531,12 +637,20 @@ def rolling_forecast(data, target_col, total_months, window_months, update_freq,
             new_data = pd.DataFrame({
                 'date': pred_dates,
                 target_col: stage_pred['predicted_sales'].values,
-                'unit_price': [future_price] * len(pred_dates)
+                'unit_price': np.nan
             })
             # 为其他特征填充默认值
             for col in feature_cols:
                 if col not in new_data.columns and col in current_data.columns:
-                    new_data[col] = current_data[col].iloc[-1] if len(current_data) > 0 else 0
+                    if col == 'month_num' and len(current_data) > 0:
+                        start = float(current_data[col].iloc[-1])
+                        new_data[col] = np.arange(start + 1, start + len(pred_dates) + 1)
+                    elif col == 'year':
+                        new_data[col] = pred_dates.year
+                    elif col == 'month':
+                        new_data[col] = pred_dates.month
+                    else:
+                        new_data[col] = forecast_feature_series(current_data[col], len(pred_dates))
             
             current_data = pd.concat([current_data, new_data], ignore_index=True)
             current_data = current_data.sort_values('date').tail(window_months + steps)
@@ -720,7 +834,7 @@ if main_file is not None:
                 with st.spinner("正在训练模型并进行预测..."):
                     try:
                         # 准备特征列
-                        feature_cols = ['month_num']
+                        feature_cols = ['month_num', 'year', 'month']
                         
                         # 添加Steam口碑特征（如果可用且用户选择使用）
                         if use_steam_features:
@@ -764,8 +878,7 @@ if main_file is not None:
                                 total_months=total_forecast_months,
                                 window_months=rolling_window,
                                 update_freq=update_frequency,
-                                future_price=future_unit_price,
-                                feature_cols=[col for col in feature_cols if col != 'month_num']
+                                feature_cols=feature_cols
                             )
 
                         elif prediction_mode == "SARIMAX高级预测 (模式C)":
@@ -776,13 +889,14 @@ if main_file is not None:
                                 df,
                                 target_col='monthly_sales',
                                 total_months=total_forecast_months,
-                                exogenous_cols=[col for col in feature_cols if col != 'month_num'],
+                                exogenous_cols=feature_cols,
                                 order=(p_value, d_value, q_value),
                                 seasonal_order=seasonal_for_mode_c
                             )
 
                         predictions = clip_prediction_bounds(predictions)
-                        predictions['unit_price'] = future_unit_price
+                        future_price_series = forecast_unit_price(df, total_forecast_months)
+                        predictions['unit_price'] = future_price_series
                         predictions['predicted_revenue'] = predictions['predicted_sales'] * predictions['unit_price']
                         
                         # 保存预测结果
