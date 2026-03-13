@@ -359,7 +359,124 @@ def train_sarimax_model(data, target_col='monthly_sales', exogenous_cols=None, o
     results = model.fit(disp=False)
     return results
 
-def rolling_forecast(data, target_col, total_months, window_months, update_freq, feature_cols=None):
+def lifecycle_decay_forecast(data, target_col='monthly_sales', total_months=12):
+    """针对游戏销量生命周期（首发峰值 -> 衰减 -> 长尾）的稳健预测。"""
+    data = data.sort_values('date').copy()
+    sales = data[target_col].fillna(0).clip(lower=0).astype(float).values
+    n = len(sales)
+
+    if n < 2:
+        base = max(float(sales[-1]) if n == 1 else 0.0, 0.0)
+        pred = np.repeat(base, total_months)
+        lower = pred * 0.85
+        upper = pred * 1.15
+    else:
+        intro_window = min(max(3, n // 6), 6)
+        peak_sales = max(np.max(sales[:intro_window]), 1.0)
+
+        tail_series = sales[intro_window-1:]
+        x_tail = np.arange(len(tail_series), dtype=float)
+        y_tail = np.log1p(np.clip(tail_series, a_min=0, a_max=None))
+        weights = np.linspace(0.8, 1.2, len(x_tail))
+
+        if len(x_tail) >= 2:
+            slope, intercept = np.polyfit(x_tail, y_tail, deg=1, w=weights)
+        else:
+            slope, intercept = -0.02, y_tail[-1]
+
+        # 约束衰减斜率：不允许出现长期上涨，避免首发峰值被外推
+        slope = min(slope, -0.005)
+
+        future_x = np.arange(len(x_tail), len(x_tail) + total_months, dtype=float)
+        pred_log = intercept + slope * future_x
+        pred = np.expm1(pred_log)
+
+        # 长尾锚定：以最近销量中位数作为最低合理基线，避免下穿失真
+        tail_anchor = np.median(sales[-min(6, n):])
+        floor_level = max(tail_anchor * 0.5, 0.0)
+        pred = np.maximum(pred, floor_level)
+
+        # 限制不超过历史首发峰值附近，避免过度外推
+        pred = np.minimum(pred, peak_sales * 1.1)
+
+        residuals = y_tail - (intercept + slope * x_tail)
+        resid_std = float(np.std(residuals)) if len(residuals) > 1 else 0.30
+        z = 1.64  # 约90%区间
+        lower = np.expm1(pred_log - z * resid_std)
+        upper = np.expm1(pred_log + z * resid_std)
+
+        # 置信区间同样遵循业务边界
+        lower = np.maximum(lower, floor_level * 0.8)
+        upper = np.minimum(np.maximum(upper, pred), peak_sales * 1.35)
+
+    last_date = data['date'].iloc[-1]
+    future_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=total_months, freq='MS')
+
+    predictions_df = pd.DataFrame({
+        'date': future_dates,
+        'predicted_sales': np.clip(pred, a_min=0, a_max=None),
+        'lower_bound': np.clip(lower, a_min=0, a_max=None),
+        'upper_bound': np.clip(upper, a_min=0, a_max=None)
+    })
+    predictions_df['lower_bound'] = np.minimum(predictions_df['lower_bound'], predictions_df['predicted_sales'])
+    predictions_df['upper_bound'] = np.maximum(predictions_df['upper_bound'], predictions_df['predicted_sales'])
+    return predictions_df
+
+def clip_prediction_bounds(predictions):
+    """统一非负约束与区间修正，防止异常预测进入图表/导出。"""
+    predictions = predictions.copy()
+    predictions['predicted_sales'] = predictions['predicted_sales'].clip(lower=0)
+
+    if 'lower_bound' in predictions.columns:
+        predictions['lower_bound'] = predictions['lower_bound'].clip(lower=0)
+        predictions['lower_bound'] = np.minimum(predictions['lower_bound'], predictions['predicted_sales'])
+
+    if 'upper_bound' in predictions.columns:
+        predictions['upper_bound'] = predictions['upper_bound'].clip(lower=0)
+        predictions['upper_bound'] = np.maximum(predictions['upper_bound'], predictions['predicted_sales'])
+
+    return predictions
+
+def sarimax_log_forecast(data, target_col, total_months, exogenous_cols=None, order=(1,1,1), seasonal_order=(0,0,0,0)):
+    """在log1p空间建模SARIMAX，预测后expm1还原，降低负值与发散风险。"""
+    if exogenous_cols is None:
+        exogenous_cols = []
+
+    model_data = data.sort_values('date').copy()
+    y_log = np.log1p(model_data[target_col].fillna(0).clip(lower=0))
+    X_train = model_data[exogenous_cols] if exogenous_cols else None
+
+    model = SARIMAX(
+        y_log,
+        exog=X_train,
+        order=order,
+        seasonal_order=seasonal_order,
+        enforce_stationarity=False,
+        enforce_invertibility=False
+    )
+    results = model.fit(disp=False)
+
+    X_future = None
+    if exogenous_cols:
+        last_values = model_data[exogenous_cols].iloc[-1:].copy()
+        X_future = pd.concat([last_values] * total_months, ignore_index=True)
+
+    forecast = results.get_forecast(steps=total_months, exog=X_future)
+    pred_log = forecast.predicted_mean.values
+    pred_conf_log = forecast.conf_int().values
+
+    last_date = model_data['date'].iloc[-1]
+    future_dates = pd.date_range(last_date + pd.offsets.MonthBegin(1), periods=total_months, freq='MS')
+
+    predictions = pd.DataFrame({
+        'date': future_dates,
+        'predicted_sales': np.expm1(pred_log),
+        'lower_bound': np.expm1(pred_conf_log[:, 0]),
+        'upper_bound': np.expm1(pred_conf_log[:, 1])
+    })
+    return clip_prediction_bounds(predictions)
+
+def rolling_forecast(data, target_col, total_months, window_months, update_freq, future_price, feature_cols=None):
     """分阶段滚动预测"""
     if feature_cols is None:
         feature_cols = []
@@ -390,42 +507,21 @@ def rolling_forecast(data, target_col, total_months, window_months, update_freq,
         else:
             train_data = current_data.copy()
         
-        # 准备外生变量
-        exogenous_cols = [col for col in feature_cols if col in train_data.columns]
-        X_train = train_data[exogenous_cols] if exogenous_cols else None
-        
-        # 训练模型（简化为非季节性ARIMA）
-        model = SARIMAX(
-            train_data[target_col],
-            exog=X_train,
-            order=(1,1,1),
-            seasonal_order=(0,0,0,0),
-            enforce_stationarity=False
+        # 分阶段采用生命周期衰减模型，短样本下比高阶时序模型更稳健
+        stage_pred = lifecycle_decay_forecast(
+            train_data.rename(columns={target_col: 'monthly_sales'}),
+            target_col='monthly_sales',
+            total_months=steps
         )
-        results = model.fit(disp=False)
-        
-        # 为未来期间准备外生变量（这里简化处理）
-        X_future = None
-        if exogenous_cols:
-            # 在实际应用中，这里需要用户提供或合理推测未来的外生变量值
-            X_future = pd.DataFrame(
-                np.zeros((steps, len(exogenous_cols))),
-                columns=exogenous_cols
-            )
-        
-        # 进行预测
-        forecast = results.get_forecast(steps=steps, exog=X_future)
-        pred_mean = forecast.predicted_mean
-        pred_conf = forecast.conf_int()
         
         # 记录预测结果
         pred_dates = future_dates[start_idx:start_idx+steps]
         for i, date in enumerate(pred_dates):
             all_predictions.append({
                 'date': date,
-                'predicted_sales': pred_mean.iloc[i] if i < len(pred_mean) else pred_mean.iloc[-1],
-                'lower_bound': pred_conf.iloc[i, 0] if i < len(pred_conf) else pred_conf.iloc[-1, 0],
-                'upper_bound': pred_conf.iloc[i, 1] if i < len(pred_conf) else pred_conf.iloc[-1, 1]
+                'predicted_sales': stage_pred['predicted_sales'].iloc[i],
+                'lower_bound': stage_pred['lower_bound'].iloc[i],
+                'upper_bound': stage_pred['upper_bound'].iloc[i]
             })
             all_dates.append(date)
         
@@ -434,8 +530,8 @@ def rolling_forecast(data, target_col, total_months, window_months, update_freq,
         if start_idx + update_freq < total_months:
             new_data = pd.DataFrame({
                 'date': pred_dates,
-                target_col: pred_mean.values,
-                'unit_price': [future_unit_price] * len(pred_dates)
+                target_col: stage_pred['predicted_sales'].values,
+                'unit_price': [future_price] * len(pred_dates)
             })
             # 为其他特征填充默认值
             for col in feature_cols:
@@ -446,7 +542,7 @@ def rolling_forecast(data, target_col, total_months, window_months, update_freq,
             current_data = current_data.sort_values('date').tail(window_months + steps)
     
     predictions_df = pd.DataFrame(all_predictions)
-    return predictions_df
+    return clip_prediction_bounds(predictions_df)
 
 # 主程序逻辑
 if main_file is not None:
@@ -653,114 +749,41 @@ if main_file is not None:
                         # 根据选择的模式进行预测
                         if prediction_mode == "基础长期预测 (模式A)":
                             st.subheader("📈 基础长期预测结果")
-                            
-                            # 使用SARIMAX模型
-                            model_results = train_sarimax_model(
-                                df, 
+                            # 采用生命周期衰减模型，避免长期发散与负值
+                            predictions = lifecycle_decay_forecast(
+                                df,
                                 target_col='monthly_sales',
-                                exogenous_cols=[col for col in feature_cols if col != 'month_num'],
-                                order=(1,1,1),
-                                seasonal_order=(1,1,1,12)
+                                total_months=total_forecast_months
                             )
-                            
-                            # 准备未来外生变量
-                            X_future = None
-                            exogenous_for_future = [col for col in feature_cols if col != 'month_num']
-                            if exogenous_for_future:
-                                last_values = df[exogenous_for_future].iloc[-1:].copy()
-                                X_future = pd.concat([last_values] * total_forecast_months, ignore_index=True)
-                            
-                            # 进行预测
-                            forecast = model_results.get_forecast(
-                                steps=total_forecast_months,
-                                exog=X_future
-                            )
-                            
-                            pred_mean = forecast.predicted_mean
-                            pred_conf = forecast.conf_int()
-                            
-                            # 生成未来日期
-                            last_date = df['date'].iloc[-1]
-                            future_dates = pd.date_range(
-                                last_date + pd.offsets.MonthBegin(1), 
-                                periods=total_forecast_months, 
-                                freq='MS'
-                            )
-                            
-                            # 创建预测结果DataFrame
-                            predictions = pd.DataFrame({
-                                'date': future_dates,
-                                'predicted_sales': pred_mean.values,
-                                'lower_bound': pred_conf.iloc[:, 0].values,
-                                'upper_bound': pred_conf.iloc[:, 1].values,
-                                'unit_price': future_unit_price
-                            })
-                            
-                            predictions['predicted_revenue'] = predictions['predicted_sales'] * predictions['unit_price']
-                            
+
                         elif prediction_mode == "分阶段滚动预测 (模式B)":
                             st.subheader("🔄 分阶段滚动预测结果")
-                            
                             predictions = rolling_forecast(
                                 df,
                                 target_col='monthly_sales',
                                 total_months=total_forecast_months,
                                 window_months=rolling_window,
                                 update_freq=update_frequency,
+                                future_price=future_unit_price,
                                 feature_cols=[col for col in feature_cols if col != 'month_num']
                             )
-                            
-                            predictions['unit_price'] = future_unit_price
-                            predictions['predicted_revenue'] = predictions['predicted_sales'] * predictions['unit_price']
-                            
+
                         elif prediction_mode == "SARIMAX高级预测 (模式C)":
                             st.subheader("🎯 SARIMAX高级预测结果")
-                            
-                            # 使用用户设置的参数
-                            model_results = train_sarimax_model(
-                                df, 
+                            # 使用log1p空间SARIMAX，削弱短样本季节项导致的异常外推
+                            seasonal_for_mode_c = (1, 1, 1, seasonal_period) if len(df) >= seasonal_period * 2 else (0, 0, 0, 0)
+                            predictions = sarimax_log_forecast(
+                                df,
                                 target_col='monthly_sales',
+                                total_months=total_forecast_months,
                                 exogenous_cols=[col for col in feature_cols if col != 'month_num'],
                                 order=(p_value, d_value, q_value),
-                                seasonal_order=(1,1,1,seasonal_period)
+                                seasonal_order=seasonal_for_mode_c
                             )
-                            
-                            # 如果有未来的营销计划，使用它作为外生变量
-                            X_future = None
-                            if marketing_file is not None:
-                                # 这里应该使用之前加载的future_marketing数据
-                                # 简化处理：使用最后的值
-                                exogenous_for_future = [col for col in feature_cols if col != 'month_num']
-                                if exogenous_for_future:
-                                    last_values = df[exogenous_for_future].iloc[-1:].copy()
-                                    X_future = pd.concat([last_values] * total_forecast_months, ignore_index=True)
-                            
-                            # 进行预测
-                            forecast = model_results.get_forecast(
-                                steps=total_forecast_months,
-                                exog=X_future
-                            )
-                            
-                            pred_mean = forecast.predicted_mean
-                            pred_conf = forecast.conf_int()
-                            
-                            # 生成未来日期
-                            last_date = df['date'].iloc[-1]
-                            future_dates = pd.date_range(
-                                last_date + pd.offsets.MonthBegin(1), 
-                                periods=total_forecast_months, 
-                                freq='MS'
-                            )
-                            
-                            predictions = pd.DataFrame({
-                                'date': future_dates,
-                                'predicted_sales': pred_mean.values,
-                                'lower_bound': pred_conf.iloc[:, 0].values,
-                                'upper_bound': pred_conf.iloc[:, 1].values,
-                                'unit_price': future_unit_price
-                            })
-                            
-                            predictions['predicted_revenue'] = predictions['predicted_sales'] * predictions['unit_price']
+
+                        predictions = clip_prediction_bounds(predictions)
+                        predictions['unit_price'] = future_unit_price
+                        predictions['predicted_revenue'] = predictions['predicted_sales'] * predictions['unit_price']
                         
                         # 保存预测结果
                         st.session_state.future_features = predictions
