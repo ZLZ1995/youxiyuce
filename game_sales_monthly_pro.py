@@ -251,6 +251,20 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
         existing_mapping = {k: v for k, v in column_mapping.items() if k in df.columns}
         df = df.rename(columns=existing_mapping)
         
+        # 统一数值清洗（先清洗再参与任何计算/比较）
+        numeric_cols = [
+            'monthly_sales', 'unit_price', 'steam_positive', 'steam_negative',
+            'steam_total', 'positive_rate', 'net_positive', 'marketing_event',
+            'total_revenue'
+        ]
+        for col in numeric_cols:
+            if col in df.columns:
+                df[col] = normalize_numeric_series(df[col], is_ratio=(col == 'positive_rate'))
+
+        # 营销事件单独归一化，确保后续比较/建模时一定是数值
+        if 'marketing_event' in df.columns:
+            df['marketing_event'] = normalize_marketing_event(df['marketing_event'])
+
         # 自动识别并清洗历史单价
         df['unit_price'] = prepare_unit_price_series(df)
         
@@ -301,6 +315,10 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
                 if '日期' in marketing_df.columns:
                     marketing_df['日期'] = pd.to_datetime(marketing_df['日期'])
                     marketing_df.set_index('日期', inplace=True)
+                    if '营销事件' in marketing_df.columns:
+                        marketing_df['营销事件'] = normalize_marketing_event(marketing_df['营销事件'])
+                    if 'marketing_event' in marketing_df.columns:
+                        marketing_df['marketing_event'] = normalize_marketing_event(marketing_df['marketing_event'])
                     marketing_df.index.name = 'date'
                     future_marketing = marketing_df
                     st.success("已成功加载未来营销计划")
@@ -308,7 +326,8 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
                 st.warning(f"营销计划数据读取失败: {str(e)}")
         
         # 添加时间特征
-        df = df.sort_values('date')
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date']).sort_values('date')
         df['month_num'] = range(1, len(df) + 1)
         df['year'] = df['date'].dt.year
         df['month'] = df['date'].dt.month
@@ -321,6 +340,74 @@ def process_uploaded_data(main_file, domestic_file, auto_aggregate=False):
         
     except Exception as e:
         return None, f"数据处理失败: {str(e)}"
+
+def normalize_numeric_series(series, is_ratio=False):
+    """稳健数值清洗：兼容逗号、百分号、空字符串、中文空值文本等。"""
+    if series is None:
+        return pd.Series(dtype=float)
+
+    s = series.copy()
+    s_str = s.astype(str).str.strip()
+    s_lower = s_str.str.lower()
+
+    null_tokens = {
+        '', ' ', 'none', 'null', 'nan', 'na', 'n/a', '-', '--',
+        '无', '暂无', '未知', '空', '未填写', '未填', '缺失'
+    }
+    is_null = s_lower.isin(null_tokens)
+    is_percent = s_str.str.contains('%', regex=False)
+
+    cleaned = (
+        s_str.str.replace(',', '', regex=False)
+             .str.replace('，', '', regex=False)
+             .str.replace('%', '', regex=False)
+    )
+    numeric = pd.to_numeric(cleaned, errors='coerce')
+    numeric[is_null] = np.nan
+
+    if is_ratio:
+        numeric.loc[is_percent] = numeric.loc[is_percent] / 100.0
+        # 对未带百分号但明显是百分比写法（例如 85）做兜底转换
+        ratio_mask = (~is_percent) & numeric.notna() & (numeric > 1) & (numeric <= 100)
+        numeric.loc[ratio_mask] = numeric.loc[ratio_mask] / 100.0
+        numeric = numeric.clip(lower=0, upper=1)
+
+    return numeric.astype(float)
+
+def normalize_marketing_event(series):
+    """营销事件归一化：无事件=0；有事件=正数，兼容数字/字符串/中文文本。"""
+    s_str = series.astype(str).str.strip()
+    s_lower = s_str.str.lower()
+
+    numeric = pd.to_numeric(s_str, errors='coerce')
+    normalized = pd.Series(np.nan, index=series.index, dtype=float)
+    normalized.loc[numeric.notna()] = numeric.loc[numeric.notna()].astype(float)
+
+    no_event_tokens = {
+        '', ' ', 'none', 'null', 'nan', 'na', 'n/a', '-', '--',
+        '无', '否', '无活动', '未投放', '无投放', '无宣发', '不投放', '没有'
+    }
+    no_event_mask = s_lower.isin(no_event_tokens)
+    normalized.loc[no_event_mask] = 0.0
+
+    # 事件文本映射（可扩展）：至少保证“有事件 -> 正数”
+    keyword_scores = {
+        3.0: ['大型更新', '节日活动', '版本更新', '大版本', '直播带货'],
+        2.0: ['促销', '活动', '宣发', '广告投放', '广告', '联动'],
+        1.0: ['小型更新', '更新', '上新', '曝光']
+    }
+    unknown_text_mask = normalized.isna() & (~no_event_mask)
+    for score, keywords in keyword_scores.items():
+        kw_mask = unknown_text_mask & s_str.apply(lambda x: any(k in x for k in keywords))
+        normalized.loc[kw_mask] = score
+
+    # 其余无法识别但非空文本，按“有事件”处理为1，避免字符串残留
+    fallback_event_mask = normalized.isna() & (~no_event_mask)
+    normalized.loc[fallback_event_mask] = 1.0
+
+    normalized = normalized.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    normalized = normalized.clip(lower=0)
+    return normalized.astype(float)
 
 def prepare_unit_price_series(data, min_price=1.0, max_price=500.0, fallback_price=35.0):
     """自动生成并清洗历史单价序列。优先使用unit_price，其次用total_revenue/monthly_sales反推。"""
@@ -728,8 +815,9 @@ if main_file is not None:
                                          line=dict(color='blue', width=2)))
                 
                 if 'marketing_event' in df.columns:
-                    event_dates = df[df['marketing_event'] > 0]['date']
-                    event_sales = df[df['marketing_event'] > 0]['monthly_sales']
+                    event_mask = pd.to_numeric(df['marketing_event'], errors='coerce').fillna(0) > 0
+                    event_dates = df.loc[event_mask, 'date']
+                    event_sales = df.loc[event_mask, 'monthly_sales']
                     fig1.add_trace(go.Scatter(x=event_dates, y=event_sales,
                                              mode='markers', name='营销事件',
                                              marker=dict(color='red', size=10, symbol='diamond')))
